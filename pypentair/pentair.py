@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import time
+from json import dumps as json_dumps
 from typing import Any, Final
 from urllib.parse import urljoin
 
+import jwt
 import requests
 from boto3 import client as boto_client
 from botocore.auth import SigV4Auth
@@ -15,12 +18,13 @@ from botocore.exceptions import ClientError
 from pycognito import Cognito
 
 from .const import CLIENT_ID, IDENTITY_POOL_ID, REGION_NAME, USER_POOL_ID
-from .exceptions import PentairAuthenticationError
+from .exceptions import PentairApiException, PentairAuthenticationError
 from .utils import decode, redact
 
 _LOGGER = logging.getLogger(__name__)
 
 BASE_URL: Final = "https://api.pentair.cloud/"
+TOKEN_REFRESH_WINDOW: Final = 300  # seconds
 
 
 class Pentair:
@@ -129,20 +133,74 @@ class Pentair:
         """Get devices."""
         return self.__get("device/device-service/user/devices")
 
-    def __request(self, method: str, url: str, **kwargs: Any) -> Any:
-        """Make a request."""
-        _LOGGER.debug("Making %s request to %s with %s", method, url, redact(kwargs))
+    def update_device(self, device_id: str, fields: dict[str, Any]) -> Any:
+        """Update device fields."""
+        return self.__put(
+            f"device/device-service/user/device/{device_id}",
+            json={"payload": fields},
+            success_code="set_device_success",
+        )
 
+    def refresh_tokens(self) -> None:
+        """Renew the Cognito tokens and drop the cached SigV4 credentials."""
+        self.get_user().renew_access_token()
+        self._auth = None
+
+    def _id_token_expires_in(self) -> float:
+        """Return the seconds until the id token expires, or 0 if unknown."""
+        if not (token := self.id_token):
+            return 0
+        try:
+            claims = jwt.decode(token, options={"verify_signature": False})
+            return float(claims["exp"]) - time.time()
+        except (jwt.PyJWTError, KeyError, TypeError, ValueError):
+            return 0
+
+    def __send(
+        self, method: str, url: str, data: bytes | None, **kwargs: Any
+    ) -> requests.Response:
+        """Sign and send a request."""
+        headers = {"x-amz-id-token": self.id_token}
+        if data is not None:
+            headers["content-type"] = "application/json; charset=UTF-8"
+        # The body must be attached before signing, as it is part of the signature.
         request = AWSRequest(
-            method=method,
-            url=urljoin(BASE_URL, url),
-            headers={"x-amz-id-token": self.id_token},
+            method=method, url=urljoin(BASE_URL, url), data=data, headers=headers
         )
         self.get_auth().add_auth(request)
         prepped = request.prepare()
-        response = requests.request(
-            method, prepped.url, headers=prepped.headers, timeout=10, **kwargs
+        return requests.request(
+            method,
+            prepped.url,
+            headers=prepped.headers,
+            data=data,
+            timeout=10,
+            **kwargs,
         )
+
+    def __request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json: Any = None,
+        success_code: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Make a request."""
+        _LOGGER.debug(
+            "Making %s request to %s with %s", method, url, redact(json or kwargs)
+        )
+
+        if self.refresh_token and self._id_token_expires_in() < TOKEN_REFRESH_WINDOW:
+            self.refresh_tokens()
+
+        data = None if json is None else json_dumps(json).encode()
+        response = self.__send(method, url, data, **kwargs)
+        if response.status_code in (401, 403) and self.refresh_token:
+            _LOGGER.debug("Received %s, refreshing tokens", response.status_code)
+            self.refresh_tokens()
+            response = self.__send(method, url, data, **kwargs)
 
         json = response.json()
         _LOGGER.debug(
@@ -151,6 +209,9 @@ class Pentair:
         if (status_code := response.status_code) != 200:
             _LOGGER.error("Status: %s - %s", status_code, json)
             response.raise_for_status()
+        if success_code and (json.get("data") or {}).get("code") != success_code:
+            _LOGGER.error("Unexpected response from %s: %s", url, json)
+            raise PentairApiException(f"Unexpected response: {json}")
         return json
 
     def __get(self, url: str, **kwargs: Any) -> Any:
@@ -162,3 +223,7 @@ class Pentair:
     ) -> Any:
         """Make a post request."""
         return self.__request("post", url, **kwargs)
+
+    def __put(self, url: str, **kwargs: Any) -> Any:
+        """Make a put request."""
+        return self.__request("put", url, **kwargs)
